@@ -1,6 +1,6 @@
 {
-  "name": "Calculadora BVC",
-  "short_name": "BVC Calc",
+  "name": "Calculadora de Retenciones",
+  "short_name": "Calculadora de Retenciones",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

@@ -6,6 +6,35 @@ document.addEventListener('DOMContentLoaded', () => {
             .catch((err) => console.error('Error registrando Service Worker:', err));
     }
 
+    let deferredPrompt;
+    const installBtn = document.getElementById('installBtn');
+
+    window.addEventListener('beforeinstallprompt', (e) => {
+        e.preventDefault();
+        deferredPrompt = e;
+        if (installBtn) installBtn.hidden = false;
+    });
+
+    if (installBtn) {
+        installBtn.addEventListener('click', async () => {
+            installBtn.disabled = true;
+            try {
+                if (!deferredPrompt) return;
+                deferredPrompt.prompt();
+                const choice = await deferredPrompt.userChoice;
+                console.log('Instalación:', choice.outcome);
+                deferredPrompt = null;
+                installBtn.hidden = true;
+            } finally {
+                installBtn.disabled = false;
+            }
+        });
+    }
+
+    window.addEventListener('appinstalled', () => {
+        console.log('App instalada');
+        if (installBtn) installBtn.hidden = true;
+    });
     // Current Rate Display
     const bcvRateDisplay = document.getElementById('bcv-rate-display');
 
@@ -73,22 +102,38 @@ document.addEventListener('DOMContentLoaded', () => {
         return null; // Failed to find a rate
     }
 
-    // Function to get and update the current day's rate display
+    // Function to get and update the current day's effective rate display
     async function updateCurrentRateDisplay() {
         bcvRateDisplay.textContent = 'Obteniendo tasa BCV actual...';
-        const url = 'https://api.dolarvzla.com/public/exchange-rate';
+        // Aproximación de hora local Caracas (UTC-4, sin DST)
+        const utcNow = new Date();
+        const caracasNow = new Date(utcNow.getTime() - 4 * 60 * 60 * 1000);
+        const todayIso = caracasNow.toISOString().split('T')[0];
+        const caracasHour = caracasNow.getUTCHours(); // horas en Caracas
+
+        // Si es fin de semana/feriado, usar día hábil anterior.
+        // Si es día hábil antes de las 16:00, aún rige la tasa del día hábil anterior.
+        let effectiveIso;
+        const todayDate = new Date(todayIso + 'T12:00:00.000Z');
+        if (isWeekend(todayDate) || isBankHolidayISO(todayIso) || caracasHour < 16) {
+            effectiveIso = previousBusinessDayFromIso(todayIso);
+        } else {
+            effectiveIso = todayIso;
+        }
+
+        const url = `https://api.dolarvzla.com/public/exchange-rate/list?from=${effectiveIso}&to=${effectiveIso}`;
         try {
             const response = await fetch(url);
             const data = await response.json();
-            if (data.current && data.current.usd) {
-                currentBcvRate = parseFloat(data.current.usd);
-                bcvRateDisplay.innerHTML = `Tasa BCV (Hoy): <strong>${currentBcvRate.toFixed(2)} Bs./USD</strong>`;
+            if (data.rates && data.rates.length > 0 && data.rates[0].usd) {
+                currentBcvRate = parseFloat(data.rates[0].usd);
+                bcvRateDisplay.innerHTML = `Tasa BCV (vigente): <strong>${currentBcvRate.toFixed(2)} Bs./USD</strong> <small>(publicada: ${effectiveIso})</small>`;
             } else {
-                throw new Error('Formato de API inesperado para tasa actual.');
+                throw new Error('Formato de API inesperado para tasa efectiva.');
             }
         } catch (error) {
-            console.error('Error al obtener la tasa BCV actual:', error);
-            bcvRateDisplay.textContent = 'Error al obtener la tasa BCV actual.';
+            console.error('Error al obtener la tasa BCV efectiva:', error);
+            bcvRateDisplay.textContent = 'Error al obtener la tasa BCV efectiva.';
         }
     }
 
@@ -155,3 +200,63 @@ document.addEventListener('DOMContentLoaded', () => {
         adjustedFinalAmountBsSpan.textContent = adjustedFinalAmountBs.toFixed(2);
     });
 });
+
+    // Function to compute previous business day (weekends + optional bank holidays)
+    function isWeekend(date) {
+        const d = date.getUTCDay(); // 0: Sun, 6: Sat
+        return d === 0 || d === 6;
+    }
+
+    function isBankHolidayISO(isoDate) {
+        // Placeholder list that you can extend with feriados bancarios (YYYY-MM-DD)
+        const holidays = new Set([
+            // Ejemplos: '2025-01-01', '2025-07-05'
+        ]);
+        return holidays.has(isoDate);
+    }
+
+    function previousBusinessDayFromIso(isoDate) {
+        // Start from noon UTC to avoid timezone edge cases
+        let d = new Date(isoDate + 'T12:00:00.000Z');
+        // Move one day back first, because la tasa aplicada en un día hábil
+        // corresponde a la publicada el día hábil anterior
+        d.setUTCDate(d.getUTCDate() - 1);
+        // Skip weekends and holidays
+        while (true) {
+            const checkIso = d.toISOString().split('T')[0];
+            if (!isWeekend(d) && !isBankHolidayISO(checkIso)) {
+                return checkIso;
+            }
+            d.setUTCDate(d.getUTCDate() - 1);
+        }
+    }
+
+    // Function to get BCV rate using effective published date
+    async function getBcvRate(startDateIso) {
+        const maxTries = 7; // Look back up to 7 days
+        let effectiveIso = previousBusinessDayFromIso(startDateIso);
+        let currentDate = new Date(effectiveIso + 'T12:00:00.000Z');
+
+        for (let i = 0; i < maxTries; i++) {
+            const dateString = currentDate.toISOString().split('T')[0];
+            const url = `https://api.dolarvzla.com/public/exchange-rate/list?from=${dateString}&to=${dateString}`;
+            try {
+                const response = await fetch(url);
+                if (!response.ok) {
+                    console.warn(`API error for date ${dateString}: ${response.status}`);
+                    currentDate.setUTCDate(currentDate.getUTCDate() - 1);
+                    continue;
+                }
+                const data = await response.json();
+                if (data.rates && data.rates.length > 0 && data.rates[0].usd) {
+                    return { rate: parseFloat(data.rates[0].usd), date: dateString };
+                }
+                currentDate.setUTCDate(currentDate.getUTCDate() - 1);
+            } catch (error) {
+                console.error(`Error fetching rate for ${dateString}:`, error);
+                currentDate.setUTCDate(currentDate.getUTCDate() - 1);
+            }
+        }
+        bcvRateDisplay.textContent = 'Error al obtener la tasa BCV. No se encontró tasa en los últimos 7 días.';
+        return null;
+    }
